@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""tempur-usb-power: keep the bed DAC's USB 5V on only while the TV is sending audio.
+
+Chain: TV optical -> HifiBerry Digi (WM8804) -> CamillaDSP (tempur-dsp.service)
+       -> "AB13X USB Audio" dongle -> 3.5mm splitter -> bed.
+A powered dongle on the splitter blocks the bed's massage mode, so the dongle's
+5V is cut whenever the TV has been silent for OFF_DELAY seconds.
+
+Power switch: RP1 GPIO "USB_VBUS_EN" (gpiochip0 line 42) gates 5V to all four
+USB ports. Disabling a port in sysfs or USB-suspending the dongle does NOT cut
+5V on a Pi 5; this line does.
+
+Audio detection:
+  ON  state: CamillaDSP holds the capture device, so ask it over its websocket
+             (-p 1234) for the recent capture peak.
+  OFF state: nothing else uses the capture device, so hold it open ourselves and
+             return on the first sample above SIGNAL_ABS. TV standby keeps the
+             optical carrier alive but sends pure digital zeros.
+Tunables come from the environment (see the systemd unit).
+Timers use the monotonic clock: this Pi boots with a stale wall clock that NTP
+later steps forward, which must not look like a long silence.
+"""
+import base64, json, os, socket, struct, subprocess, sys, time
+import numpy as np
+
+CAPTURE_DEV = os.environ.get("CAPTURE_DEV", "hw:sndrpihifiberry")
+DAC_CARD    = "/proc/asound/" + os.environ.get("DAC_CARD", "Audio")
+DSP_UNIT    = os.environ.get("DSP_UNIT", "tempur-dsp.service")
+WS_HOST     = os.environ.get("WS_HOST", "127.0.0.1")
+WS_PORT     = int(os.environ.get("WS_PORT", "1234"))
+VBUS_LINE   = os.environ.get("VBUS_LINE", "USB_VBUS_EN")
+OFF_DELAY   = float(os.environ.get("OFF_DELAY", "60"))   # s of silence before 5V off
+SIGNAL_DB   = float(os.environ.get("SIGNAL_DB", "-80"))  # CamillaDSP peak above this = audio
+SIGNAL_ABS  = int(os.environ.get("SIGNAL_ABS", "8"))     # raw |sample| above this = audio
+POLL        = float(os.environ.get("POLL", "2"))
+ON_WAIT     = int(os.environ.get("ON_WAIT", "15"))        # s to wait for the DAC to enumerate
+RESET_WAIT  = float(os.environ.get("RESET_WAIT", "5"))    # s to wait for the dongle's self-reset
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def sh(*args):
+    return subprocess.run(args, capture_output=True, text=True)
+
+
+def vbus(on):
+    """Drive USB_VBUS_EN. gpioset -z leaves a holder process; replace it each time."""
+    subprocess.run(["pkill", "-x", "gpioset"], capture_output=True)
+    time.sleep(0.2)
+    r = sh("gpioset", "-z", f"{VBUS_LINE}={1 if on else 0}")
+    if r.returncode:
+        log(f"WARNING: gpioset failed: {r.stderr.strip()}")
+
+
+def dac_present():
+    return os.path.exists(DAC_CARD)
+
+
+def dac_ready():
+    """Card registered AND its playback device node exists (udev finished)."""
+    try:
+        card = os.path.basename(os.readlink(DAC_CARD))  # e.g. 'card3'
+    except OSError:
+        return False
+    return os.path.exists(f"/dev/snd/pcmC{card[4:]}D0p")
+
+
+def dsp_active():
+    return sh("systemctl", "is-active", DSP_UNIT).stdout.strip() == "active"
+
+
+def ws_query(message, timeout=2.0):
+    """Minimal RFC6455 client: one text frame out, one frame back."""
+    s = socket.create_connection((WS_HOST, WS_PORT), timeout)
+    try:
+        key = base64.b64encode(os.urandom(16)).decode()
+        s.sendall((f"GET / HTTP/1.1\r\nHost: {WS_HOST}:{WS_PORT}\r\nUpgrade: websocket\r\n"
+                   f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+                   "Sec-WebSocket-Version: 13\r\n\r\n").encode())
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = s.recv(4096)
+            if not chunk:
+                raise ConnectionError("closed during handshake")
+            buf += chunk
+        if b" 101 " not in buf.split(b"\r\n", 1)[0]:
+            raise ConnectionError("websocket handshake refused")
+        payload = message.encode()
+        mask = os.urandom(4)
+        n = len(payload)
+        if n < 126:
+            hdr = bytes([0x81, 0x80 | n])
+        elif n < 65536:
+            hdr = bytes([0x81, 0x80 | 126]) + struct.pack(">H", n)
+        else:
+            hdr = bytes([0x81, 0x80 | 127]) + struct.pack(">Q", n)
+        s.sendall(hdr + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+
+        def recvn(k):
+            d = b""
+            while len(d) < k:
+                c = s.recv(k - len(d))
+                if not c:
+                    raise ConnectionError("closed mid-frame")
+                d += c
+            return d
+
+        _b1, b2 = recvn(2)
+        n = b2 & 0x7F
+        if n == 126:
+            n = struct.unpack(">H", recvn(2))[0]
+        elif n == 127:
+            n = struct.unpack(">Q", recvn(8))[0]
+        if b2 & 0x80:
+            m = recvn(4)
+            data = bytes(b ^ m[i % 4] for i, b in enumerate(recvn(n)))
+        else:
+            data = recvn(n)
+        # Polite close handshake (opcode 8), otherwise CamillaDSP logs a WARN per poll.
+        try:
+            s.sendall(bytes([0x88, 0x80]) + os.urandom(4))
+            s.settimeout(0.5)
+            recvn(2)
+        except Exception:
+            pass
+        return data.decode()
+    finally:
+        s.close()
+
+
+def capture_peak_db(window):
+    """Highest capture peak (dBFS) over the last `window` seconds per CamillaDSP, or None."""
+    try:
+        reply = json.loads(ws_query(json.dumps({"GetCaptureSignalPeakSince": window})))
+        body = reply["GetCaptureSignalPeakSince"]
+        if body.get("result") != "Ok":
+            return None
+        vals = [float(v) for v in body["value"]]
+        return max(vals) if vals else None
+    except Exception:
+        return None
+
+
+def wait_for_signal():
+    """Hold the capture open and return True on the first sample above SIGNAL_ABS.
+    Returns False if arecord stopped (device busy, clock lost); the caller retries."""
+    chunk = 4800 * 4  # 100 ms of S16_LE stereo
+    p = subprocess.Popen(["arecord", "-q", "-D", CAPTURE_DEV, "-f", "S16_LE", "-c", "2",
+                          "-r", "48000", "-t", "raw"],
+                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+        while True:
+            b = p.stdout.read(chunk)
+            if not b:
+                return False
+            if np.abs(np.frombuffer(b, dtype=np.int16)).max() > SIGNAL_ABS:
+                return True
+    finally:
+        p.kill()
+        p.wait()
+
+
+def power_on_and_start():
+    """Power the dongle and start the DSP once the dongle is genuinely ready.
+
+    This AB13X dongle enumerates ~1 s after power-on, then drops off the bus and
+    re-enumerates itself ~3.4 s later (observed with nothing else touching it).
+    Starting the DSP before that reset makes its first start die with
+    "No such device" and costs a 2 s systemd restart. So: wait for the first
+    appearance, then for the disappear/reappear cycle (or RESET_WAIT seconds
+    without one), then start.
+    """
+    t0 = time.monotonic()
+    vbus(True)
+    while time.monotonic() - t0 < ON_WAIT and not dac_ready():
+        time.sleep(0.05)
+    if not dac_ready():
+        log(f"DAC did not enumerate within {ON_WAIT}s; 5V off, will retry")
+        vbus(False)
+        return False
+    t_first = time.monotonic()
+    seen_gone = False
+    while time.monotonic() - t_first < RESET_WAIT:
+        present = dac_present()
+        if not present:
+            seen_gone = True
+        elif seen_gone and dac_ready():
+            break
+        time.sleep(0.05)
+    sh("systemctl", "start", DSP_UNIT)
+    log(f"DAC up after {t_first - t0:.1f}s, {'reset seen' if seen_gone else 'no reset'}, "
+        f"DSP start issued at {time.monotonic() - t0:.1f}s")
+    return True
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--probe":
+        log(f"dac_present={dac_present()} dsp_active={dsp_active()} "
+            f"peak_last_{POLL + 1:.0f}s={capture_peak_db(POLL + 1)}")
+        return
+    state = "on" if dac_present() else "off"
+    vbus(state == "on")   # re-assert the line so a watcher restart can't leave it undefined
+    last_signal = time.monotonic()
+    log(f"start: state={state} off_delay={OFF_DELAY:.0f}s vbus_line={VBUS_LINE}")
+    while True:
+        if state == "off":
+            if wait_for_signal():
+                log("audio detected -> 5V on, starting DSP")
+                if power_on_and_start():
+                    state, last_signal = "on", time.monotonic()
+            else:
+                time.sleep(2)
+        else:
+            peak = capture_peak_db(POLL + 1)
+            if peak is None and dac_present() and not dsp_active():
+                # DAC is powered but the DSP isn't running (crash, manual stop): own it.
+                sh("systemctl", "start", DSP_UNIT)
+            if peak is not None and peak > SIGNAL_DB:
+                last_signal = time.monotonic()
+            if time.monotonic() - last_signal >= OFF_DELAY:
+                log(f"silence for {OFF_DELAY:.0f}s -> stopping DSP, 5V off")
+                sh("systemctl", "stop", DSP_UNIT)
+                vbus(False)
+                state = "off"
+            else:
+                time.sleep(POLL)
+
+
+if __name__ == "__main__":
+    main()

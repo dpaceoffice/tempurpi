@@ -1,0 +1,25 @@
+title: "Tempur Direct Audio Bridge"
+
+devices:
+  samplerate: 48000
+  chunksize: 128
+  target_level: 128
+
+  enable_rate_adjust: true
+  resampler:
+    type: AsyncSinc
+    profile: Balanced
+
+  capture:
+    type: Alsa
+    channels: 2
+    device: "hw:sndrpihifiberry"
+    format: S24_4_LE
+
+  playback:
+    type: Alsa
+    channels: 2
+    device: "hw:Audio"
+    format: S16_LE
+
+pipeline: []

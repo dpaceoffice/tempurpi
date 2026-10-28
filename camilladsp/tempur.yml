@@ -1,0 +1,101 @@
+title: "Tempur Direct Audio Bridge (bass limiter)"
+
+devices:
+  samplerate: 48000
+  chunksize: 128
+  target_level: 128
+
+  enable_rate_adjust: true
+  resampler:
+    type: AsyncSinc
+    profile: Balanced
+
+  capture:
+    type: Alsa
+    channels: 2
+    device: "hw:sndrpihifiberry"
+    format: S24_4_LE
+
+  playback:
+    type: Alsa
+    channels: 2
+    device: "hw:Audio"
+    format: S16_LE
+
+# Bass-only limiter: splits each channel at 100 Hz, limits the low band only, and sums the
+# bands back. Linkwitz-Riley 4th-order halves sum to a flat magnitude response, so anything
+# below the threshold passes unchanged. Tune `threshold` by ear on the loudest bass drops.
+mixers:
+  split:
+    channels:
+      in: 2
+      out: 4
+    mapping:
+      - dest: 0
+        sources:
+          - channel: 0
+      - dest: 1
+        sources:
+          - channel: 1
+      - dest: 2
+        sources:
+          - channel: 0
+      - dest: 3
+        sources:
+          - channel: 1
+  join:
+    channels:
+      in: 4
+      out: 2
+    mapping:
+      - dest: 0
+        sources:
+          - channel: 0
+          - channel: 2
+      - dest: 1
+        sources:
+          - channel: 1
+          - channel: 3
+
+filters:
+  xo_low:
+    type: BiquadCombo
+    parameters:
+      type: LinkwitzRileyLowpass
+      freq: 100
+      order: 4
+  xo_high:
+    type: BiquadCombo
+    parameters:
+      type: LinkwitzRileyHighpass
+      freq: 100
+      order: 4
+
+processors:
+  bass_limit:
+    type: Compressor
+    parameters:
+      channels: 4
+      attack: 0.01
+      release: 0.3
+      threshold: -15
+      factor: 10.0
+      makeup_gain: 0
+      monitor_channels: [0, 1]
+      process_channels: [0, 1]
+
+pipeline:
+  - type: Mixer
+    name: split
+  - type: Filter
+    channels: [0, 1]
+    names:
+      - xo_low
+  - type: Filter
+    channels: [2, 3]
+    names:
+      - xo_high
+  - type: Processor
+    name: bass_limit
+  - type: Mixer
+    name: join

@@ -1,0 +1,47 @@
+title: "Tempur Direct Audio Bridge (lowpass)"
+
+devices:
+  samplerate: 48000
+  chunksize: 128
+  target_level: 128
+
+  enable_rate_adjust: true
+  resampler:
+    type: AsyncSinc
+    profile: Balanced
+
+  capture:
+    type: Alsa
+    channels: 2
+    device: "hw:sndrpihifiberry"
+    format: S24_4_LE
+
+  playback:
+    type: Alsa
+    channels: 2
+    device: "hw:Audio"
+    format: S16_LE
+
+filters:
+  lowpass:
+    type: BiquadCombo
+    parameters:
+      type: ButterworthLowpass
+      freq: 120
+      order: 4
+  # The plain config never exceeds the TV's own full scale. The lowpass can overshoot it
+  # (a filtered full-scale square wave peaks about 2 dB over), so cap the output at -1 dBFS,
+  # which also leaves headroom for inter-sample peaks in the dongle's DAC.
+  ceiling:
+    type: Limiter
+    parameters:
+      soft_clip: false
+      clip_limit: -1.0
+
+pipeline:
+  - type: Filter
+    description: "Bass only, capped below full scale"
+    channels: [0, 1]
+    names:
+      - lowpass
+      - ceiling

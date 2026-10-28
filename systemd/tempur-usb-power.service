@@ -1,0 +1,18 @@
+[Unit]
+Description=Tempur bed DAC USB 5V (on only while the TV sends audio)
+After=sound.target tempur-dsp.service
+Wants=sound.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/tempur-usb-power
+# Tunables: seconds of silence before the 5V is cut, and what counts as audio.
+Environment=OFF_DELAY=5
+Environment=POLL=1
+Environment=SIGNAL_DB=-80
+Environment=SIGNAL_ABS=8
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

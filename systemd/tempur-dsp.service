@@ -1,0 +1,25 @@
+[Unit]
+Description=Tempur Bed CamillaDSP
+After=sound.target
+Wants=sound.target
+
+[Service]
+Type=simple
+User=david
+Group=audio
+
+# Set USB DAC output to 100% / 0 dB
+ExecStartPre=/usr/bin/amixer -q -c Audio sset PCM 100% unmute
+
+# Wait until the TV is actually sending 48 kHz PCM over optical
+ExecStartPre=/bin/bash -c 'until /usr/bin/timeout 3 /usr/bin/arecord -q -D hw:sndrpihifiberry -f S16_LE -c 2 -r 48000 -d 1 /dev/null >/dev/null 2>&1; do /usr/bin/sleep 2; done'
+
+# Start DSP
+ExecStart=/usr/local/bin/camilladsp /home/david/.config/camilladsp/tempur.yml
+
+Restart=always
+RestartSec=2
+TimeoutStartSec=infinity
+
+[Install]
+WantedBy=multi-user.target
