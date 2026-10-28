@@ -17,7 +17,8 @@ bed's massage mode does not work, so `tempur-usb-power` cuts the DAC's 5V whenev
 been silent for a few seconds and restores it when audio returns.
 
 The transducers carry the low end only; a separate TV soundbar plays the highs. CamillaDSP runs
-a bass-only limiter that keeps the transducers from distorting on the loudest bass drops.
+a subsonic filter and a bass-only limiter that keep the transducers from rattling and distorting
+on the loudest bass drops.
 
 ## Shopping list
 
@@ -48,7 +49,7 @@ Software: Debian 13 (trixie) with Raspberry Pi OS packages, CamillaDSP 4.1.3.
 | `systemd/tempur-dsp.service` | `/etc/systemd/system/` | CamillaDSP, optical in to USB DAC out |
 | `systemd/tempur-dsp.service.d/websocket.conf` | `/etc/systemd/system/tempur-dsp.service.d/` | Opens the CamillaDSP websocket on 127.0.0.1:1234 for the watcher; retries the DAC volume step while the card settles |
 | `systemd/tempur-dsp.service.d/recovery.conf` | `/etc/systemd/system/tempur-dsp.service.d/` | Disables the start rate limit so the DSP always restarts |
-| `camilladsp/tempur.yml` | `~/.config/camilladsp/` | The deployed config: 48 kHz, S24 capture from the Digi+ I/O, S16 playback to the dongle, async resampler for clock drift, bass limiter (see below) |
+| `camilladsp/tempur.yml` | `~/.config/camilladsp/` | The deployed config: 48 kHz, S24 capture from the Digi+ I/O, S16 playback to the dongle, async resampler for clock drift, subsonic filter and bass limiter (see below) |
 | `camilladsp/tempur-plain.yml` | `~/.config/camilladsp/tempur.yml` (optional) | Same devices, no processing |
 | `camilladsp/tempur-lowpass.yml` | `~/.config/camilladsp/tempur.yml` (optional) | Bass-only output with a -1 dBFS ceiling (see below) |
 | `wireplumber/50-tempur-dac-ignore.conf` | `~/.config/wireplumber/wireplumber.conf.d/` | Keeps PipeWire from claiming the dongle, which CamillaDSP opens as `hw:Audio` |
@@ -121,7 +122,9 @@ sudo chroot /media/root-ro systemctl enable tempur-dsp.service tempur-usb-power.
 sudo mount -o remount,ro /media/root-ro
 ```
 
-If the last command reports the mount point busy, reboot to bring the layer back read-only.
+Overwrite files that already exist on the layer in place with `sudo cp`. Replacing them (for
+example with `install`, which deletes and recreates the file) leaves the layer busy, and the
+last command then fails until a reboot brings the layer back read-only.
 
 ## Tunables
 
@@ -149,11 +152,12 @@ the recent capture peak, then exits.
 The ProSmart's massage transducers distort on the loudest bass drops. Tempur does not publish
 power ratings for the soundbar,
 its amplifier or the transducers (the owner's manual rates only the base's 29 V DC, 2 A supply),
-so the threshold is set by ear. `camilladsp/tempur.yml` splits each channel at 100 Hz, limits
-the low band only, and sums the bands back:
+so the threshold is set by ear. `camilladsp/tempur.yml` removes subsonic content, splits each
+channel at 100 Hz, limits the low band only, and sums the bands back:
 
 | Stage | Setting |
 |---|---|
+| Subsonic | Butterworth highpass, 20 Hz, 4th order: -0.3 dB at 28 Hz, 0.0 dB at 40 Hz, -3 dB at 20 Hz, -10 dB at 15 Hz, -24 dB at 10 Hz. The massage transducers work at 28-40 Hz; below that they move a lot and make little sound. |
 | Crossover | Linkwitz-Riley, 100 Hz, 4th order. The two halves sum to a flat magnitude response. |
 | Low band | Compressor: threshold -15 dBFS, ratio 10:1, attack 10 ms, release 0.3 s, no makeup gain, stereo-linked |
 | High band | Untouched |
@@ -166,7 +170,7 @@ Measured on the Pi with CamillaDSP 4.1.3, feeding test signals through the pipel
 | Full-band noise peaking at 0 dBFS | 0.0 dB |
 | 60 Hz tone, -30 dBFS | 0.0 dB |
 | 60 Hz tone, 0 dBFS | -12.5 dB |
-| 20 Hz tone, 0 dBFS | -18.0 dB |
+| 20 Hz tone, 0 dBFS | -18.3 dB |
 
 On TV audio it takes up to about 6 dB off the loudest bass passages and leaves the rest alone. The
 crossover's phase shift can raise peaks slightly (0.9 dB on full-band noise); the TV here peaks
@@ -194,8 +198,8 @@ the bass limiter.
 
 A lowpass can overshoot full scale (a filtered full-scale square wave peaks about 2 dB over).
 The ceiling holds the output below full scale, and the extra 1 dB covers inter-sample peaks in
-the dongle's DAC. Nothing below -1 dBFS is touched. There is no highpass: the ProSmart's
-massage transducers run at 28 and 40 Hz.
+the dongle's DAC. Nothing below -1 dBFS is touched. It has no subsonic filter; copy the
+`subsonic` filter and its pipeline step from `tempur.yml` to add one.
 
 Measured on the Pi with CamillaDSP 4.1.3, feeding test signals through this pipeline from a file:
 

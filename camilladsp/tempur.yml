@@ -1,4 +1,4 @@
-title: "Tempur Direct Audio Bridge (bass limiter)"
+title: "Tempur Direct Audio Bridge (bass limiter, subsonic)"
 
 devices:
   samplerate: 48000
@@ -58,6 +58,14 @@ mixers:
           - channel: 3
 
 filters:
+  # The ProSmart's massage transducers work at 28-40 Hz. Below that they move a lot and
+  # make little sound, which is where they rattle. -0.3 dB at 28 Hz, -3 dB at 20 Hz.
+  subsonic:
+    type: BiquadCombo
+    parameters:
+      type: ButterworthHighpass
+      freq: 20
+      order: 4
   xo_low:
     type: BiquadCombo
     parameters:
@@ -85,6 +93,10 @@ processors:
       process_channels: [0, 1]
 
 pipeline:
+  - type: Filter
+    channels: [0, 1]
+    names:
+      - subsonic
   - type: Mixer
     name: split
   - type: Filter
