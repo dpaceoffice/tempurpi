@@ -20,6 +20,13 @@ The transducers carry the low end only; a separate TV soundbar plays the highs. 
 a subsonic filter and a bass-only limiter that keep the transducers from rattling and distorting
 on the loudest bass drops.
 
+## Video
+
+[![I Wired My TV Into My Tempur-Pedic Bed (6-Month Review)](https://img.youtube.com/vi/FrP_pa1eklw/maxresdefault.jpg)](https://youtu.be/FrP_pa1eklw)
+
+The build and six months with the bed: [I Wired My TV Into My Tempur-Pedic Bed (6-Month Review)](https://youtu.be/FrP_pa1eklw).
+The 25-second version: [YouTube Short](https://youtube.com/shorts/RZuB-Sl8bO4).
+
 ## Shopping list
 
 The parts this build uses, with US list prices (October 2026) where the vendor publishes one.
